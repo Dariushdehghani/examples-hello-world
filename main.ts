@@ -100,7 +100,21 @@ export default async function (req: Request): Promise<Response> {
       return Response.json({ e: "method_not_allowed" }, { status: 405 });
     }
 
-    const body = await req.json();
+    // Parse body safely to handle empty body edge case
+    let body;
+    try {
+      const text = await req.text();
+      if (!text) {
+        return Response.json({ e: "empty_body" }, { status: 400 });
+      }
+      body = JSON.parse(text);
+    } catch (parseErr) {
+      return Response.json(
+        { e: "invalid_json" },
+        { status: 400 },
+      );
+    }
+
     if (!body || typeof body !== "object") {
       return Response.json({ e: "bad_json" }, { status: 400 });
     }
@@ -136,15 +150,50 @@ export default async function (req: Request): Promise<Response> {
 
     let payload: Uint8Array | undefined;
     if (typeof b64 === "string" && b64.length > 0) {
-      payload = decodeBase64ToBytes(b64);
+      try {
+        payload = decodeBase64ToBytes(b64);
+      } catch (decodeErr) {
+        return Response.json(
+          { e: "invalid_base64" },
+          { status: 400 },
+        );
+      }
     }
 
-    const resp = await fetch(u, {
-      method: m,
-      headers: h,
-      body: payload,
-      redirect: "manual",
-    });
+    // Add timeout and better error handling for fetch
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 30000); // 30s timeout
+
+    let resp;
+    try {
+      resp = await fetch(u, {
+        method: m,
+        headers: h,
+        body: payload,
+        redirect: "manual",
+        signal: controller.signal,
+      });
+    } catch (fetchErr) {
+      clearTimeout(timeout);
+      const message = fetchErr instanceof Error ? fetchErr.message : String(fetchErr);
+      return Response.json({ e: `fetch_failed: ${message}` }, { status: 502 });
+    } finally {
+      clearTimeout(timeout);
+    }
+
+    // Check if response body exists and is readable
+    let data: Uint8Array;
+    try {
+      if (resp.body === null) {
+        // Empty response body (e.g., 204 No Content)
+        data = new Uint8Array(0);
+      } else {
+        data = new Uint8Array(await resp.arrayBuffer());
+      }
+    } catch (bodyErr) {
+      const message = bodyErr instanceof Error ? bodyErr.message : String(bodyErr);
+      return Response.json({ e: `body_read_failed: ${message}` }, { status: 502 });
+    }
 
     // `fetch()` (Deno / Bun / Node) auto-decompresses gzip / br / deflate
     // responses, so `resp.arrayBuffer()` returns plain bytes — but the
@@ -155,21 +204,30 @@ export default async function (req: Request): Promise<Response> {
     // different from what the destination announced. Strip both. The
     // Apps Script + Rust transport layer below us re-frames the wire body
     // anyway, so neither header is meaningful to forward.
-    const data = new Uint8Array(await resp.arrayBuffer());
     const respHeaders: Record<string, string> = {};
     resp.headers.forEach((value, key) => {
       const lower = key.toLowerCase();
+      // Strip content-encoding and content-length to prevent decode errors
       if (lower === "content-encoding" || lower === "content-length") return;
       respHeaders[key] = value;
     });
 
+    let encodedBody: string;
+    try {
+      encodedBody = data.length > 0 ? encodeBytesToBase64(data) : "";
+    } catch (encodeErr) {
+      const message = encodeErr instanceof Error ? encodeErr.message : String(encodeErr);
+      return Response.json({ e: `body_encode_failed: ${message}` }, { status: 500 });
+    }
+
     return Response.json({
       s: resp.status,
       h: respHeaders,
-      b: encodeBytesToBase64(data),
+      b: encodedBody,
     });
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
+    console.error("Exit node error:", message, err);
     return Response.json({ e: message }, { status: 500 });
   }
 }
